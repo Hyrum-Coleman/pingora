@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -80,7 +80,7 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub fn set_alpn(&mut self, alpn: ALPN) {
         self.alpn_protocols = Some(alpn.to_wire_protocols());
     }
 

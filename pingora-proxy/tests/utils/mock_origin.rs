@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,11 @@ fn init() -> bool {
     #[cfg(feature = "openssl_derived")]
     let src_cert_path = format!(
         "{}/tests/utils/conf/keys/server_boringssl_openssl.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    #[cfg(feature = "s2n")]
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_s2n.crt",
         env!("CARGO_MANIFEST_DIR")
     );
 

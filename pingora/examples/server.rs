@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -157,6 +157,10 @@ pub fn main() {
             .unwrap();
     }
     #[cfg(feature = "rustls")]
+    {
+        tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+    }
+    #[cfg(feature = "s2n")]
     {
         tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     }
