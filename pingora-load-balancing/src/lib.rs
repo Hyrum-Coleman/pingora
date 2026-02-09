@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -323,7 +323,7 @@ pub struct LoadBalancer<S> {
     pub parallel_health_check: bool,
 }
 
-impl<S: BackendSelection> LoadBalancer<S>
+impl<S> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
     S::Iter: BackendIter,
@@ -344,6 +344,22 @@ where
             .expect("static should not block")
             .expect("static should not error");
         Ok(lb)
+    }
+
+    /// Build a [LoadBalancer] with the given [Backends] and the config.
+    pub fn from_backends_with_config(backends: Backends, config: &S::Config) -> Self {
+        let selector = ArcSwap::new(Arc::new(S::build_with_config(
+            &backends.get_backend(),
+            config,
+        )));
+
+        LoadBalancer {
+            backends,
+            selector,
+            health_check_frequency: None,
+            update_frequency: None,
+            parallel_health_check: false,
+        }
     }
 
     /// Build a [LoadBalancer] with the given [Backends].
