@@ -548,6 +548,7 @@ mod test {
         assert_eq!(listener2.as_str(), addr);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_tcp_so_reuseport_false() {
         let addr = "127.0.0.1:7202";
