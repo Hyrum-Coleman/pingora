@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ struct LockCtx {
 }
 
 /// Optional user-defined subrequest context.
-pub type UserCtx = Box<(dyn Any + Sync + Send)>;
+pub type UserCtx = Box<dyn Any + Sync + Send>;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum BodyMode {

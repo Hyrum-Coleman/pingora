@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 
 // default maximum upstream retries for retry-able proxy errors
@@ -67,6 +68,13 @@ pub struct ServerConf {
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
+    /// The maximum number of unique s2n configs to cache. Creating a new s2n config is an
+    /// expensive operation, so we cache and re-use config objects with identical configurations.
+    /// A value of 0 disables the cache.
+    ///
+    /// WARNING: Disabling the s2n config cache can result in poor performance
+    #[cfg(feature = "s2n")]
+    pub s2n_config_cache_size: Option<usize>,
     /// Grace period in seconds before starting the final step of the graceful shutdown after signaling shutdown.
     pub grace_period_seconds: Option<u64>,
     /// Timeout in seconds of the final step for the graceful shutdown.
@@ -102,6 +110,12 @@ pub struct ServerConf {
     ///
     /// This setting is a fail-safe and defaults to 16.
     pub max_retries: usize,
+    /// Maximum number of retries for upgrade socket connect and accept operations.
+    /// This controls how many times send_fds_to will retry connecting and how many times
+    /// get_fds_from will retry accepting during graceful upgrades.
+    /// The retry interval is 1 second between attempts.
+    /// If not set, defaults to 5 retries.
+    pub upgrade_sock_connect_accept_max_retries: Option<usize>,
 }
 
 impl Default for ServerConf {
@@ -111,6 +125,8 @@ impl Default for ServerConf {
             client_bind_to_ipv4: vec![],
             client_bind_to_ipv6: vec![],
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             daemon: false,
             error_log: None,
             upstream_debug_ssl_keylog: false,
@@ -127,6 +143,7 @@ impl Default for ServerConf {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
+            upgrade_sock_connect_accept_max_retries: None,
         }
     }
 }
@@ -152,7 +169,7 @@ pub struct Opt {
 
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[clap(long, hidden = true)]
+    #[clap(long, hide = true)]
     pub nocapture: bool,
 
     /// Test the configuration and exit
@@ -249,6 +266,14 @@ impl Opt {
     pub fn parse_args() -> Self {
         Opt::parse()
     }
+
+    pub fn parse_from_args<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Opt::parse_from(args)
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +292,8 @@ mod tests {
             client_bind_to_ipv4: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
             client_bind_to_ipv6: vec![],
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             daemon: false,
             error_log: None,
             upstream_debug_ssl_keylog: false,
@@ -283,6 +310,7 @@ mod tests {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: 1,
+            upgrade_sock_connect_accept_max_retries: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
