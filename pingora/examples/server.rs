@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[global_allocator]
-static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+// #[global_allocator]
+// static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use pingora::listeners::tls::TlsSettings;
 use pingora::protocols::TcpKeepalive;
@@ -137,7 +137,7 @@ pub fn main() {
     });
 
     echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);
-    echo_service_http.add_uds("/tmp/echo.sock", None);
+    // echo_service_http.add_uds("/tmp/echo.sock", None);
 
     let mut tls_settings;
 
