@@ -14,8 +14,6 @@
 
 //! Cache key
 
-use super::*;
-
 use blake2::{Blake2b, Digest};
 use http::Extensions;
 use serde::{Deserialize, Serialize};
@@ -147,7 +145,7 @@ impl CacheKey {
 
 /// Storage optimized cache key to keep in memory or in storage
 // 16 bytes + 8 bytes (+16 * u8) + user_tag.len() + 16 Bytes (Box<str>)
-#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompactCacheKey {
     pub primary: HashBinary,
     // save 8 bytes for non-variance but waste 8 bytes for variance vs, store flat 16 bytes
@@ -212,18 +210,6 @@ impl CacheKey {
         hasher.update(&self.namespace);
         hasher.update(&self.primary);
         hasher
-    }
-
-    /// Create a default [CacheKey] from a request, which just takes its URI as the primary key.
-    pub fn default(req_header: &ReqHeader) -> Self {
-        CacheKey {
-            namespace: Vec::new(),
-            primary: format!("{}", req_header.uri).into_bytes(),
-            primary_bin_override: None,
-            variance: None,
-            user_tag: "".into(),
-            extensions: Extensions::new(),
-        }
     }
 
     /// Create a new [CacheKey] from the given namespace, primary, and user_tag input.

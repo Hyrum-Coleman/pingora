@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
@@ -24,6 +24,8 @@ use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
+
+const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -81,8 +83,8 @@ where
         }
 
         // cache lookup logic
+        let mut cache_lock_retries = 0;
         loop {
-            // for cache lock, TODO: cap the max number of loops
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
@@ -118,7 +120,8 @@ where
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        let now = SystemTime::now();
+                        let is_fresh = meta.is_fresh(now);
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
@@ -147,7 +150,7 @@ where
                                 HitStatus::ForceExpired
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
-                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -158,10 +161,20 @@ where
 
                     if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
-                        if session.cache.is_cache_locked() {
+                        if !session.cache.enabled() {
+                            // An admission policy may have disabled caching during cache_lookup().
+                            break None;
+                        } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
                             let lock_status = session.cache.cache_lock_wait().await;
                             if self.handle_lock_status(session, ctx, lock_status) {
+                                if self.cache_lock_retry_limit_exceeded(
+                                    session,
+                                    ctx,
+                                    &mut cache_lock_retries,
+                                ) {
+                                    break None;
+                                }
                                 continue;
                             } else {
                                 break None;
@@ -196,6 +209,13 @@ where
                             if !will_serve_stale {
                                 let lock_status = session.cache.cache_lock_wait().await;
                                 if self.handle_lock_status(session, ctx, lock_status) {
+                                    if self.cache_lock_retry_limit_exceeded(
+                                        session,
+                                        ctx,
+                                        &mut cache_lock_retries,
+                                    ) {
+                                        break None;
+                                    }
                                     continue;
                                 } else {
                                     break None;
@@ -367,7 +387,7 @@ where
             if !range_filter.is_multipart_range() || !hit_handler.can_seek_multipart() {
                 return Ok(false);
             }
-            let r = range_filter.next_cache_multipart_range();
+            let r = range_filter.next_cache_multipart_range()?;
             hit_handler.seek_multipart(r.start, Some(r.end))?;
             // we still need RangeBodyFilter's help to transform the byte
             // range into a multipart response.
@@ -487,6 +507,7 @@ where
             }
         }
 
+        // No enabled() guard: no concurrent upstream can disable cache here.
         if let Err(e) = session.cache.finish_hit_handler().await {
             warn!("Error during finish_hit_handler: {}", e);
         }
@@ -539,6 +560,19 @@ where
     }
 
     // TODO: cache upstream header filter to add/remove headers
+
+    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    where
+        SV: ProxyHttp,
+    {
+        if let Err(e) = session.cache.finish_miss_handler().await {
+            warn!(
+                "Failed to finish cache miss admission: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+            session.cache.disable(NoCacheReason::StorageError);
+        }
+    }
 
     pub(crate) async fn cache_http_task(
         &self,
@@ -648,7 +682,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
@@ -661,49 +695,54 @@ where
                     }
                 }
             }
-            HttpTask::Body(data, end_stream) => match data {
-                Some(d) => {
-                    if session.cache.enabled() {
-                        // TODO: do this async
-                        // fail if writing the body would exceed the max_file_size_bytes
-                        let body_size_allowed =
-                            session.cache.track_body_bytes_for_max_file_size(d.len());
-                        if !body_size_allowed {
-                            debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
-                            session
-                                .cache
-                                .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
+            HttpTask::Body(data, end_stream) | HttpTask::UpgradedBody(data, end_stream) => {
+                // It is not normally advisable to cache upgraded responses
+                // e.g. they are essentially close-delimited, so they are easily truncated
+                // but the framework still allows for it
+                match data {
+                    Some(d) => {
+                        if session.cache.enabled() {
+                            // TODO: do this async
+                            // fail if writing the body would exceed the max_file_size_bytes
+                            let body_size_allowed =
+                                session.cache.track_body_bytes_for_max_file_size(d.len());
+                            if !body_size_allowed {
+                                debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
+                                session
+                                    .cache
+                                    .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
 
-                            return Error::e_explain(
-                                ERR_RESPONSE_TOO_LARGE,
-                                format!(
-                                    "writing data of size {} bytes would exceed max file size of {} bytes",
-                                    d.len(),
-                                    session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
-                                ),
-                            );
+                                return Error::e_explain(
+                                    ERR_RESPONSE_TOO_LARGE,
+                                    format!(
+                                        "writing data of size {} bytes would exceed max file size of {} bytes",
+                                        d.len(),
+                                        session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
+                                    ),
+                                );
+                            }
+
+                            // this will panic if more data is sent after we see end_stream
+                            // but should be impossible in real world
+                            let miss_handler = session.cache.miss_handler().unwrap();
+
+                            miss_handler.write_body(d.clone(), *end_stream).await?;
+                            if *end_stream {
+                                self.finish_miss_handler_best_effort(session, ctx).await;
+                            }
                         }
-
-                        // this will panic if more data is sent after we see end_stream
-                        // but should be impossible in real world
-                        let miss_handler = session.cache.miss_handler().unwrap();
-
-                        miss_handler.write_body(d.clone(), *end_stream).await?;
-                        if *end_stream {
-                            session.cache.finish_miss_handler().await?;
+                    }
+                    None => {
+                        if session.cache.enabled() && *end_stream {
+                            self.finish_miss_handler_best_effort(session, ctx).await;
                         }
                     }
                 }
-                None => {
-                    if session.cache.enabled() && *end_stream {
-                        session.cache.finish_miss_handler().await?;
-                    }
-                }
-            },
+            }
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    session.cache.finish_miss_handler().await?;
+                    self.finish_miss_handler_best_effort(session, ctx).await;
                 }
             }
             HttpTask::Failed(_) => {
@@ -944,6 +983,32 @@ where
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
         }
     }
+
+    fn cache_lock_retry_limit_exceeded(
+        &self,
+        session: &mut Session,
+        ctx: &SV::CTX,
+        cache_lock_retries: &mut usize,
+    ) -> bool
+    where
+        SV: ProxyHttp,
+    {
+        *cache_lock_retries += 1;
+        let max_retries = session
+            .cache
+            .cache_lock_max_retries()
+            .unwrap_or(DEFAULT_MAX_CACHE_LOCK_RETRIES);
+        if *cache_lock_retries <= max_retries {
+            return false;
+        }
+
+        warn!(
+            "Cache lock retry limit exceeded, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session.cache.disable(NoCacheReason::CacheLockRetryLimit);
+        true
+    }
 }
 
 fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
@@ -1022,6 +1087,12 @@ pub mod range_filter {
             // No ranges provided
             return RangeType::None;
         };
+
+        // "bytes=" with an empty (or whitespace-only) range-set is syntactically a
+        // range request with zero satisfiable range-specs, so return 416.
+        if ranges_str.trim().is_empty() {
+            return RangeType::Invalid;
+        }
 
         // Get the actual range string (e.g."100-200,300-400")
         let mut range_count = 0;
@@ -1144,7 +1215,11 @@ pub mod range_filter {
             RangeType::new_single(0, 10)
         );
         assert_eq!(parse_range_header(b"bytes=-", 10, None), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::None);
+        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::Invalid);
+        assert_eq!(
+            parse_range_header(b"bytes=  ", 10, None),
+            RangeType::Invalid
+        );
     }
 
     // Add some tests for multi-range too
@@ -1261,7 +1336,7 @@ pub mod range_filter {
         pub ranges: Vec<Range<usize>>,
         pub boundary: String,
         total_length: usize,
-        content_type: Option<String>,
+        pub content_type: Option<String>,
     }
 
     impl MultiRangeInfo {
@@ -1475,8 +1550,9 @@ pub mod range_filter {
                 resp.insert_header(&CONTENT_LENGTH, HeaderValue::from_static("0"))
                     .unwrap();
                 resp.remove_header(&ACCEPT_RANGES);
-                // TODO: remove other headers like content-encoding
                 resp.remove_header(&CONTENT_TYPE);
+                resp.remove_header(&CONTENT_ENCODING);
+                resp.remove_header(&TRANSFER_ENCODING);
                 resp.insert_header(&CONTENT_RANGE, format!("bytes */{content_length}"))
                     .unwrap()
             }
@@ -1508,7 +1584,7 @@ pub mod range_filter {
 
         // no range, try HEAD
         let mut req = gen_req();
-        req.method = Method::HEAD;
+        req.set_method(Method::HEAD);
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
@@ -1556,6 +1632,8 @@ pub mod range_filter {
         req.insert_header("Range", "bytes=1-0").unwrap();
         let mut resp = gen_resp();
         resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
         assert_eq!(
             RangeType::Invalid,
             range_header_filter(&req, &mut resp, None)
@@ -1567,6 +1645,8 @@ pub mod range_filter {
             b"bytes */10"
         );
         assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     // Multipart Tests
@@ -1635,10 +1715,14 @@ pub mod range_filter {
         req.insert_header("Range", "bytes=1-0, 12-9, 50-40")
             .unwrap();
         let mut resp = gen_resp();
+        resp.insert_header("Content-Encoding", "br").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
         let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Invalid));
         assert_eq!(resp.status.as_u16(), 416);
         assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     #[test]
@@ -1793,23 +1877,43 @@ pub mod range_filter {
         }
 
         /// Returns the next multipart range to seek for the cache body reader.
-        pub fn next_cache_multipart_range(&mut self) -> Range<usize> {
-            match &self.range {
-                RangeType::Multi(multipart_info) => {
-                    match self.cache_multipart_idx.as_mut() {
-                        Some(v) => *v += 1,
-                        None => self.cache_multipart_idx = Some(0),
-                    }
-                    let cache_multipart_idx = self.cache_multipart_idx.expect("set above");
-                    let multipart_idx = self.multipart_idx.expect("must be set on multirange");
-                    // NOTE: currently this assumes once we start seeking multipart from the hit
-                    // handler, it will continue to return can_seek_multipart true.
-                    assert_eq!(multipart_idx, cache_multipart_idx,
-                        "cache multipart idx should match multipart idx, or there is a hit handler bug");
-                    multipart_info.ranges[cache_multipart_idx].clone()
-                }
-                _ => panic!("tried to advance multipart idx on non-multipart range"),
+        ///
+        /// The body filter and seekable cache reader must advance through each
+        /// part together. If they diverge, the response body cannot be served
+        /// correctly; report an internal error rather than panic.
+        pub fn next_cache_multipart_range(&mut self) -> Result<Range<usize>> {
+            let RangeType::Multi(multipart_info) = &self.range else {
+                return Error::e_explain(
+                    InternalError,
+                    "tried to advance cache multipart range on a non-multipart response",
+                );
+            };
+
+            let cache_multipart_idx = self.cache_multipart_idx.map_or(0, |idx| idx + 1);
+            let Some(multipart_idx) = self.multipart_idx else {
+                return Error::e_explain(
+                    InternalError,
+                    "multipart response is missing body filter progress state",
+                );
+            };
+            if multipart_idx != cache_multipart_idx {
+                return Error::e_explain(
+                    InternalError,
+                    format!(
+                        "cache multipart progress mismatch: body_filter_idx={multipart_idx}, cache_reader_idx={cache_multipart_idx}, ranges={}",
+                        multipart_info.ranges.len(),
+                    ),
+                );
             }
+
+            let Some(range) = multipart_info.ranges.get(cache_multipart_idx).cloned() else {
+                return Error::e_explain(
+                    InternalError,
+                    "cache multipart reader advanced past the final requested range",
+                );
+            };
+            self.cache_multipart_idx = Some(cache_multipart_idx);
+            Ok(range)
         }
 
         pub fn set_current_cursor(&mut self, current: usize) {
@@ -2183,6 +2287,51 @@ pub mod range_filter {
             "Missing final boundary"
         );
     }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_ends_part_early() {
+        let ranges = vec![0..10, 20..30];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..10);
+        body_filter.set_current_cursor(first.start);
+
+        // The cache reader yielded only a prefix of the selected part before
+        // reporting EOF. The filter therefore has not advanced past part 0.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"01234")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=0, cache_reader_idx=1"));
+    }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_overreads_part() {
+        let ranges = vec![0..2, 4..6, 8..10];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..2);
+        body_filter.set_current_cursor(first.start);
+
+        // A seekable reader is expected to stop at the selected part's end.
+        // This chunk spans all requested parts and advances the filter beyond
+        // what the reader's seek state records.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"0123456789")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=3, cache_reader_idx=1"));
+    }
 }
 
 // a state machine for proxy logic to tell when to use cache in the case of
@@ -2277,7 +2426,16 @@ impl ServeFromCache {
         &mut self,
         cache: &mut HttpCache,
         range: &mut RangeBodyFilter,
+        upgraded: bool,
     ) -> Result<HttpTask> {
+        fn body_task(data: Bytes, upgraded: bool) -> HttpTask {
+            if upgraded {
+                HttpTask::UpgradedBody(Some(data), false)
+            } else {
+                HttpTask::Body(Some(data), false)
+            }
+        }
+
         if !cache.enabled() {
             // Cache is disabled due to internal error
             // TODO: if nothing is sent to eyeball yet, figure out a way to recovery by
@@ -2309,7 +2467,7 @@ impl ServeFromCache {
                 }
                 loop {
                     if let Some(b) = cache.hit_handler().read_body().await? {
-                        return Ok(HttpTask::Body(Some(b), false)); // false for now
+                        return Ok(body_task(b, upgraded));
                     }
                     // EOF from hit handler for body requested
                     // if multipart, then seek again
@@ -2328,7 +2486,7 @@ impl ServeFromCache {
                 // safety: caller of enable_miss() call it only if the async_body_reader exist
                 loop {
                     if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
-                        return Ok(HttpTask::Body(Some(b), false)); // false for now
+                        return Ok(body_task(b, upgraded));
                     } else {
                         // EOF from hit handler for body requested
                         // if multipart, then seek again
@@ -2369,7 +2527,7 @@ impl ServeFromCache {
             RangeType::Multi(_info) => {
                 // safety: called only if the async_body_reader exists
                 if cache.miss_body_reader().unwrap().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
+                    let range = range_filter.next_cache_multipart_range()?;
                     cache
                         .miss_body_reader()
                         .unwrap()
@@ -2406,7 +2564,7 @@ impl ServeFromCache {
             }
             RangeType::Multi(_info) => {
                 if cache.hit_handler().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
+                    let range = range_filter.next_cache_multipart_range()?;
                     cache
                         .hit_handler()
                         .seek_multipart(range.start, Some(range.end))
