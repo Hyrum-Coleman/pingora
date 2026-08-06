@@ -150,7 +150,8 @@ impl AsRawSocket for RawStream {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
         match self {
             RawStream::Tcp(s) => s.as_raw_socket(),
-            RawStream::Virtual(virtual_socket_stream) => todo!(),
+            // Virtual stream does not have a real socket, return INVALID_SOCKET (!0)
+            RawStream::Virtual(_) => !0,
         }
     }
 }
